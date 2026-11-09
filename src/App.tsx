@@ -35,8 +35,6 @@ import {
   PiggyBank,
   ChevronDown,
   ChevronUp,
-  Play,
-  CheckCircle,
   Sliders,
   Volume2,
   VolumeX,
@@ -1100,92 +1098,6 @@ export const FastKeypad: React.FC<FastKeypadProps> = ({
 };
 
 /* ==========================================================================
-   11. COMPONENT: SCENARIO SIMULATOR (SDD Validation Bar)
-   ========================================================================== */
-
-interface ScenarioSimulatorProps {
-  onRunScenario1: () => void;
-  onRunScenario2: () => void;
-  onResetToday: () => void;
-  config: FinancialConfig;
-}
-
-export const ScenarioSimulator: React.FC<ScenarioSimulatorProps> = ({
-  onRunScenario1,
-  onRunScenario2,
-  onResetToday,
-  config,
-}) => {
-  return (
-    <div className="bg-[#121520] border border-slate-800/80 rounded-2xl p-3.5 shadow-md">
-      <div className="flex items-center justify-between mb-2">
-        <div className="flex items-center gap-1.5 text-xs font-bold uppercase tracking-wider text-slate-300">
-          <Play className="w-3.5 h-3.5 text-emerald-400 fill-emerald-400" />
-          <span>Simulação de Cenários SDD</span>
-        </div>
-        <button
-          type="button"
-          onClick={() => {
-            playKeyClick(config.soundEnabled);
-            triggerHaptic(10, config.hapticEnabled);
-            onResetToday();
-          }}
-          className="flex items-center gap-1 text-[11px] text-slate-400 hover:text-white px-2 py-0.5 rounded-md hover:bg-slate-800 transition"
-          title="Zerar lançamentos de hoje"
-        >
-          <RotateCcw className="w-3 h-3" />
-          <span>Resetar Hoje</span>
-        </button>
-      </div>
-
-      <div className="grid grid-cols-2 gap-2">
-        <button
-          type="button"
-          onClick={() => {
-            playKeyClick(config.soundEnabled);
-            triggerHaptic(15, config.hapticEnabled);
-            onRunScenario1();
-          }}
-          className="flex flex-col text-left p-2.5 rounded-xl bg-slate-900/90 hover:bg-emerald-950/30 border border-slate-800 hover:border-emerald-500/40 transition active:scale-98 group"
-        >
-          <div className="flex items-center justify-between w-full mb-1">
-            <span className="text-[10px] font-bold text-emerald-400 uppercase tracking-wider">
-              Cenário 1
-            </span>
-            <CheckCircle className="w-3.5 h-3.5 text-emerald-400 group-hover:scale-110 transition" />
-          </div>
-          <span className="text-xs font-bold text-white">Gasto de R$ 25,00</span>
-          <span className="text-[11px] text-slate-400 mt-0.5">
-            Saldo Restante: <strong className="text-emerald-300">R$ 35,00</strong>
-          </span>
-        </button>
-
-        <button
-          type="button"
-          onClick={() => {
-            playKeyClick(config.soundEnabled);
-            triggerHaptic(20, config.hapticEnabled);
-            onRunScenario2();
-          }}
-          className="flex flex-col text-left p-2.5 rounded-xl bg-slate-900/90 hover:bg-rose-950/30 border border-slate-800 hover:border-rose-500/40 transition active:scale-98 group"
-        >
-          <div className="flex items-center justify-between w-full mb-1">
-            <span className="text-[10px] font-bold text-rose-400 uppercase tracking-wider">
-              Cenário 2
-            </span>
-            <AlertTriangle className="w-3.5 h-3.5 text-rose-400 group-hover:scale-110 transition" />
-          </div>
-          <span className="text-xs font-bold text-white">Gasto de R$ 95,00</span>
-          <span className="text-[11px] text-slate-400 mt-0.5">
-            Estouro de <strong className="text-rose-300">R$ 35</strong> → Amanhã <strong className="text-white">R$ 25</strong>
-          </span>
-        </button>
-      </div>
-    </div>
-  );
-};
-
-/* ==========================================================================
    12. COMPONENT: EXPENSE LIST
    ========================================================================== */
 
@@ -1911,49 +1823,6 @@ export default function App() {
     setExpenses((prev) => prev.filter((e) => e.id !== id));
   }, []);
 
-  const handleRunScenario1 = useCallback(() => {
-    const today = getTodayDateString();
-    const filtered = expenses.filter((e) => e.date !== today);
-    const sc1Expense: Expense = {
-      id: `sc1_${Date.now()}`,
-      amount: 25.0,
-      category: 'food',
-      note: 'Almoço Executivo (Cenário 1)',
-      date: today,
-      timestamp: Date.now(),
-    };
-    setExpenses([sc1Expense, ...filtered]);
-    setSelectedDate(today);
-
-    confetti({
-      particleCount: 35,
-      spread: 60,
-      origin: { y: 0.6 },
-      colors: ['#10B981', '#34D399', '#6EE7B7'],
-      disableForReducedMotion: true,
-    });
-  }, [expenses]);
-
-  const handleRunScenario2 = useCallback(() => {
-    const today = getTodayDateString();
-    const filtered = expenses.filter((e) => e.date !== today);
-    const sc2Expense: Expense = {
-      id: `sc2_${Date.now()}`,
-      amount: 95.0,
-      category: 'shopping',
-      note: 'Compras e Jantar (Cenário 2)',
-      date: today,
-      timestamp: Date.now(),
-    };
-    setExpenses([sc2Expense, ...filtered]);
-    setSelectedDate(today);
-  }, [expenses]);
-
-  const handleResetToday = useCallback(() => {
-    const today = getTodayDateString();
-    setExpenses((prev) => prev.filter((e) => e.date !== today));
-  }, []);
-
   return (
     <div className="min-h-screen bg-[#090A0F] text-slate-100 flex flex-col font-sans pb-12 select-none">
       <OfflineIndicator />
@@ -2047,15 +1916,7 @@ export default function App() {
         {/* 2. Card em Destaque: Cota de Amanhã Recalculada em Tempo Real */}
         <TomorrowCard calculation={currentCalculation} />
 
-        {/* 3. Simulação Rápida dos Cenários SDD */}
-        <ScenarioSimulator
-          onRunScenario1={handleRunScenario1}
-          onRunScenario2={handleRunScenario2}
-          onResetToday={handleResetToday}
-          config={config}
-        />
-
-        {/* 4. Teclado Numérico Tátil (Fast Entry < 3s) */}
+        {/* 3. Teclado Numérico Tátil (Fast Entry < 3s) */}
         <FastKeypad
           onAddExpense={handleAddExpense}
           config={config}
