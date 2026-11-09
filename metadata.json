@@ -1,0 +1,6 @@
+{
+  "name": "CotaDiária - Controle de Cota Diária e Fast Entry",
+  "description": "Aplicativo PWA mobile-first para controle financeiro por cota diária, compensação dinâmica no dia seguinte e teclado numérico tátil fast-entry offline.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
