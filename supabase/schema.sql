@@ -58,6 +58,30 @@ CREATE POLICY "Permissao publica anon para financial_config"
   USING (true)
   WITH CHECK (true);
 
--- Notificação de sucesso
+-- 5. Habilitar Realtime (REPLICA IDENTITY FULL + Publication) para sincronização entre aparelhos
+ALTER TABLE public.expenses REPLICA IDENTITY FULL;
+ALTER TABLE public.financial_config REPLICA IDENTITY FULL;
+
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_publication_tables
+    WHERE pubname = 'supabase_realtime' AND schemaname = 'public' AND tablename = 'expenses'
+  ) THEN
+    ALTER PUBLICATION supabase_realtime ADD TABLE public.expenses;
+  END IF;
+
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_publication_tables
+    WHERE pubname = 'supabase_realtime' AND schemaname = 'public' AND tablename = 'financial_config'
+  ) THEN
+    ALTER PUBLICATION supabase_realtime ADD TABLE public.financial_config;
+  END IF;
+END $$;
+
+-- 6. Atualiza o cache da API PostgREST
+NOTIFY pgrst, 'reload schema';
+
+-- Comentários
 COMMENT ON TABLE public.expenses IS 'Tabela de despesas do CotaDiária';
 COMMENT ON TABLE public.financial_config IS 'Tabela de parâmetros da cota financeira diária';

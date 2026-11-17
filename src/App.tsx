@@ -67,6 +67,10 @@ import {
   deleteRemoteExpense,
   fetchRemoteConfig,
   saveRemoteConfig,
+  loadSyncQueue,
+  saveSyncQueue,
+  subscribeToRealtimeSync,
+  broadcastSyncSignal,
 } from './utils/supabase';
 
 /* ==========================================================================
@@ -1375,8 +1379,27 @@ CREATE TABLE IF NOT EXISTS public.financial_config (
 ALTER TABLE public.expenses ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.financial_config ENABLE ROW LEVEL SECURITY;
 
-CREATE POLICY "Permissao anon para expenses" ON public.expenses FOR ALL TO anon, authenticated USING (true) WITH CHECK (true);
-CREATE POLICY "Permissao anon para financial_config" ON public.financial_config FOR ALL TO anon, authenticated USING (true) WITH CHECK (true);`;
+DROP POLICY IF EXISTS "Permissao publica anon para expenses" ON public.expenses;
+CREATE POLICY "Permissao publica anon para expenses" ON public.expenses FOR ALL TO anon, authenticated USING (true) WITH CHECK (true);
+
+DROP POLICY IF EXISTS "Permissao publica anon para financial_config" ON public.financial_config;
+CREATE POLICY "Permissao publica anon para financial_config" ON public.financial_config FOR ALL TO anon, authenticated USING (true) WITH CHECK (true);
+
+-- 4. Habilitar Realtime entre aparelhos
+ALTER TABLE public.expenses REPLICA IDENTITY FULL;
+ALTER TABLE public.financial_config REPLICA IDENTITY FULL;
+
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_publication_tables WHERE pubname = 'supabase_realtime' AND schemaname = 'public' AND tablename = 'expenses') THEN
+    ALTER PUBLICATION supabase_realtime ADD TABLE public.expenses;
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_publication_tables WHERE pubname = 'supabase_realtime' AND schemaname = 'public' AND tablename = 'financial_config') THEN
+    ALTER PUBLICATION supabase_realtime ADD TABLE public.financial_config;
+  END IF;
+END $$;
+
+NOTIFY pgrst, 'reload schema';`;
 
 interface SettingsModalProps {
   isOpen: boolean;
@@ -1463,7 +1486,6 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
       clearSupabaseCredentials();
     }
     onSaveConfig(formData);
-    onSyncSupabase().catch(() => {});
     onClose();
   };
 
@@ -1674,6 +1696,8 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                     ? 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30'
                     : supabaseStatus === 'syncing'
                     ? 'bg-amber-500/15 text-amber-300 border-amber-500/30'
+                    : supabaseStatus === 'error'
+                    ? 'bg-rose-500/15 text-rose-300 border-rose-500/30'
                     : 'bg-slate-800 text-slate-400 border-slate-700'
                 }`}
               >
@@ -1681,6 +1705,8 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                   ? 'Conectado'
                   : supabaseStatus === 'syncing'
                   ? 'Sincronizando...'
+                  : supabaseStatus === 'error'
+                  ? 'Erro Sync'
                   : 'Modo Local'}
               </span>
             </div>
@@ -1998,18 +2024,25 @@ export default function App() {
     const creds = getSupabaseCredentials();
     return isValidSupabaseUrl(creds.url) && creds.anonKey ? 'syncing' : 'unconfigured';
   });
+  const [realtimeEpoch, setRealtimeEpoch] = useState(0);
 
   const configRef = useRef(config);
+  const expensesRef = useRef(expenses);
+  const isSyncingRef = useRef(false);
+  const pendingResyncRef = useRef(false);
+  const subscribedCredsRef = useRef<string>('');
+
   useEffect(() => {
     configRef.current = config;
     saveConfig(config);
   }, [config]);
 
   useEffect(() => {
+    expensesRef.current = expenses;
     saveExpenses(expenses);
   }, [expenses]);
 
-  // Synchronize with Supabase
+  // Full bidirectional reconciliation with outbox queue & delete tombstones
   const syncWithSupabase = useCallback(async () => {
     const client = getSupabaseClient();
     if (!client) {
@@ -2017,55 +2050,248 @@ export default function App() {
       return;
     }
 
+    if (isSyncingRef.current) {
+      pendingResyncRef.current = true;
+      return;
+    }
+
+    isSyncingRef.current = true;
     setSupabaseStatus('syncing');
+
     try {
+      const queue = loadSyncQueue();
+      const pendingDeletesSet = new Set(queue.pendingDeletes);
+      const pendingUpsertsSet = new Set(queue.pendingUpserts);
+      const syncedIdsSet = new Set(queue.syncedIds);
+
+      // 1. Flush pending deletions first so deleted items are removed before fetching
+      for (const delId of Array.from(pendingDeletesSet)) {
+        const deleted = await deleteRemoteExpense(delId);
+        if (deleted) {
+          pendingDeletesSet.delete(delId);
+          syncedIdsSet.delete(delId);
+          broadcastSyncSignal({ type: 'expense_deleted', id: delId });
+        }
+      }
+
+      // 2. Flush pending local creations/updates
+      const localMap = new Map(expensesRef.current.map((e) => [e.id, e]));
+      for (const upId of Array.from(pendingUpsertsSet)) {
+        const exp = localMap.get(upId);
+        if (!exp) {
+          pendingUpsertsSet.delete(upId);
+          continue;
+        }
+        const ok = await upsertRemoteExpense(exp);
+        if (ok) {
+          pendingUpsertsSet.delete(upId);
+          syncedIdsSet.add(upId);
+          broadcastSyncSignal({ type: 'expense_upserted', expense: exp });
+        }
+      }
+
+      // 3. Pull authoritative list from Supabase and reconcile
       const remoteExpenses = await fetchRemoteExpenses();
-      if (remoteExpenses !== null) {
-        setExpenses((local) => {
-          const map = new Map<string, Expense>();
-          local.forEach((e) => map.set(e.id, e));
+      if (remoteExpenses === null) {
+        saveSyncQueue({
+          pendingUpserts: Array.from(pendingUpsertsSet),
+          pendingDeletes: Array.from(pendingDeletesSet),
+          syncedIds: Array.from(syncedIdsSet),
+          pendingConfigSync: queue.pendingConfigSync,
+        });
+        setSupabaseStatus('error');
+        return;
+      }
 
-          const remoteIds = new Set(remoteExpenses.map((r) => r.id));
-          local.forEach((l) => {
-            if (!remoteIds.has(l.id)) {
-              upsertRemoteExpense(l).catch(() => {});
+      const remoteMap = new Map<string, Expense>();
+      for (const r of remoteExpenses) {
+        if (!pendingDeletesSet.has(r.id)) {
+          remoteMap.set(r.id, r);
+          syncedIdsSet.add(r.id);
+        }
+      }
+
+      const nextExpensesMap = new Map<string, Expense>(remoteMap);
+
+      // Inspect local items missing from remote
+      for (const localItem of expensesRef.current) {
+        if (pendingDeletesSet.has(localItem.id)) continue;
+        if (!remoteMap.has(localItem.id)) {
+          if (pendingUpsertsSet.has(localItem.id)) {
+            // Still queued to upload when online
+            nextExpensesMap.set(localItem.id, localItem);
+          } else if (syncedIdsSet.has(localItem.id)) {
+            // Was previously synced, now absent on Supabase -> deleted on another device!
+            syncedIdsSet.delete(localItem.id);
+          } else {
+            // Legacy/first-time local item never synced yet -> push it once
+            const ok = await upsertRemoteExpense(localItem);
+            if (ok) {
+              syncedIdsSet.add(localItem.id);
+              broadcastSyncSignal({ type: 'expense_upserted', expense: localItem });
+            } else {
+              pendingUpsertsSet.add(localItem.id);
             }
-          });
-
-          remoteExpenses.forEach((r) => {
-            map.set(r.id, r);
-          });
-
-          const merged = Array.from(map.values()).sort((a, b) => b.timestamp - a.timestamp);
-          saveExpenses(merged);
-          return merged;
-        });
+            nextExpensesMap.set(localItem.id, localItem);
+          }
+        }
       }
 
-      const remoteConfig = await fetchRemoteConfig();
-      if (remoteConfig !== null) {
-        setConfig((local) => {
-          const mergedConfig = { ...local, ...remoteConfig };
-          saveConfig(mergedConfig);
-          return mergedConfig;
-        });
+      const mergedExpenses = Array.from(nextExpensesMap.values()).sort(
+        (a, b) => b.timestamp - a.timestamp
+      );
+      expensesRef.current = mergedExpenses;
+      saveExpenses(mergedExpenses);
+      setExpenses(mergedExpenses);
+
+      // 4. Sync financial_config
+      let nextPendingConfig = queue.pendingConfigSync;
+      if (nextPendingConfig) {
+        const saved = await saveRemoteConfig(configRef.current);
+        if (saved) {
+          nextPendingConfig = false;
+          broadcastSyncSignal({ type: 'config_updated', config: configRef.current });
+        }
       } else {
-        saveRemoteConfig(configRef.current).catch(() => {});
+        const remoteConfig = await fetchRemoteConfig();
+        if (remoteConfig !== null) {
+          const mergedConfig = { ...configRef.current, ...remoteConfig };
+          configRef.current = mergedConfig;
+          saveConfig(mergedConfig);
+          setConfig(mergedConfig);
+        } else {
+          await saveRemoteConfig(configRef.current);
+        }
       }
+
+      saveSyncQueue({
+        pendingUpserts: Array.from(pendingUpsertsSet),
+        pendingDeletes: Array.from(pendingDeletesSet),
+        syncedIds: Array.from(syncedIdsSet),
+        pendingConfigSync: nextPendingConfig,
+      });
 
       setSupabaseStatus('connected');
+      const activeCreds = getSupabaseCredentials();
+      const credsKey = `${activeCreds.url}|${activeCreds.anonKey}`;
+      if (subscribedCredsRef.current !== credsKey) {
+        setRealtimeEpoch((prev) => prev + 1);
+      }
     } catch {
       setSupabaseStatus('error');
+    } finally {
+      isSyncingRef.current = false;
+      if (pendingResyncRef.current) {
+        pendingResyncRef.current = false;
+        syncWithSupabase();
+      }
     }
   }, []);
 
-  // Initial sync on app mount
+  // Initial sync + Realtime subscription + online/focus triggers
   useEffect(() => {
     const creds = getSupabaseCredentials();
-    if (isValidSupabaseUrl(creds.url) && creds.anonKey) {
-      syncWithSupabase();
+    if (!isValidSupabaseUrl(creds.url) || !creds.anonKey) {
+      subscribedCredsRef.current = '';
+      setSupabaseStatus('unconfigured');
+      return;
     }
-  }, [syncWithSupabase]);
+
+    subscribedCredsRef.current = `${creds.url}|${creds.anonKey}`;
+    syncWithSupabase();
+
+    const unsubscribeRealtime = subscribeToRealtimeSync({
+      onExpenseUpserted: (remoteExp) => {
+        const queue = loadSyncQueue();
+        if (queue.pendingDeletes.includes(remoteExp.id)) return;
+
+        const syncedSet = new Set(queue.syncedIds);
+        syncedSet.add(remoteExp.id);
+        const upsertsSet = new Set(queue.pendingUpserts);
+        upsertsSet.delete(remoteExp.id);
+
+        saveSyncQueue({
+          ...queue,
+          pendingUpserts: Array.from(upsertsSet),
+          syncedIds: Array.from(syncedSet),
+        });
+
+        setExpenses((prev) => {
+          const map = new Map(prev.map((e) => [e.id, e]));
+          map.set(remoteExp.id, remoteExp);
+          const next = Array.from(map.values()).sort((a, b) => b.timestamp - a.timestamp);
+          expensesRef.current = next;
+          saveExpenses(next);
+          return next;
+        });
+        setSupabaseStatus('connected');
+      },
+      onExpenseDeleted: (deletedId) => {
+        const queue = loadSyncQueue();
+        const syncedSet = new Set(queue.syncedIds);
+        syncedSet.delete(deletedId);
+        const upsertsSet = new Set(queue.pendingUpserts);
+        upsertsSet.delete(deletedId);
+        const deletesSet = new Set(queue.pendingDeletes);
+        deletesSet.delete(deletedId);
+
+        saveSyncQueue({
+          ...queue,
+          pendingUpserts: Array.from(upsertsSet),
+          pendingDeletes: Array.from(deletesSet),
+          syncedIds: Array.from(syncedSet),
+        });
+
+        setExpenses((prev) => {
+          const next = prev.filter((e) => e.id !== deletedId);
+          expensesRef.current = next;
+          saveExpenses(next);
+          return next;
+        });
+        setSupabaseStatus('connected');
+      },
+      onConfigUpdated: (remoteConfig) => {
+        setConfig((prev) => {
+          const merged = { ...prev, ...remoteConfig };
+          configRef.current = merged;
+          saveConfig(merged);
+          return merged;
+        });
+        setSupabaseStatus('connected');
+      },
+      onRemoteSyncRequested: () => {
+        syncWithSupabase();
+      },
+    });
+
+    const handleOnline = () => {
+      syncWithSupabase();
+    };
+
+    const handleVisibilityOrFocus = () => {
+      if (document.visibilityState === 'visible' && navigator.onLine) {
+        syncWithSupabase();
+      }
+    };
+
+    window.addEventListener('online', handleOnline);
+    window.addEventListener('focus', handleVisibilityOrFocus);
+    document.addEventListener('visibilitychange', handleVisibilityOrFocus);
+
+    const intervalId = window.setInterval(() => {
+      if (document.visibilityState === 'visible' && navigator.onLine) {
+        syncWithSupabase();
+      }
+    }, 15000);
+
+    return () => {
+      unsubscribeRealtime();
+      window.removeEventListener('online', handleOnline);
+      window.removeEventListener('focus', handleVisibilityOrFocus);
+      document.removeEventListener('visibilitychange', handleVisibilityOrFocus);
+      window.clearInterval(intervalId);
+    };
+  }, [syncWithSupabase, realtimeEpoch]);
 
   const todayStr = getTodayDateString();
   const isViewingToday = selectedDate === todayStr;
@@ -2091,10 +2317,48 @@ export default function App() {
         timestamp: Date.now(),
       };
 
-      setExpenses((prev) => [newExpense, ...prev]);
+      setExpenses((prev) => {
+        const next = [newExpense, ...prev];
+        expensesRef.current = next;
+        saveExpenses(next);
+        return next;
+      });
 
-      // Push to Supabase in background
-      upsertRemoteExpense(newExpense).catch(() => {});
+      // Queue & immediately sync with Supabase + broadcast to other devices
+      const queue = loadSyncQueue();
+      const upserts = new Set(queue.pendingUpserts);
+      upserts.add(newExpense.id);
+      const deletes = new Set(queue.pendingDeletes);
+      deletes.delete(newExpense.id);
+      saveSyncQueue({
+        ...queue,
+        pendingUpserts: Array.from(upserts),
+        pendingDeletes: Array.from(deletes),
+      });
+
+      if (getSupabaseClient()) {
+        setSupabaseStatus('syncing');
+        upsertRemoteExpense(newExpense)
+          .then((ok) => {
+            const latestQueue = loadSyncQueue();
+            const nextUpserts = new Set(latestQueue.pendingUpserts);
+            const nextSynced = new Set(latestQueue.syncedIds);
+            if (ok) {
+              nextUpserts.delete(newExpense.id);
+              nextSynced.add(newExpense.id);
+              saveSyncQueue({
+                ...latestQueue,
+                pendingUpserts: Array.from(nextUpserts),
+                syncedIds: Array.from(nextSynced),
+              });
+              broadcastSyncSignal({ type: 'expense_upserted', expense: newExpense });
+              setSupabaseStatus('connected');
+            } else {
+              setSupabaseStatus('error');
+            }
+          })
+          .catch(() => setSupabaseStatus('error'));
+      }
 
       if (currentCalculation.remainingBalance >= amount) {
         confetti({
@@ -2110,14 +2374,91 @@ export default function App() {
   );
 
   const handleDeleteExpense = useCallback((id: string) => {
-    setExpenses((prev) => prev.filter((e) => e.id !== id));
-    deleteRemoteExpense(id).catch(() => {});
+    setExpenses((prev) => {
+      const next = prev.filter((e) => e.id !== id);
+      expensesRef.current = next;
+      saveExpenses(next);
+      return next;
+    });
+
+    // Record delete tombstone immediately so syncing never resurrects it
+    const queue = loadSyncQueue();
+    const upserts = new Set(queue.pendingUpserts);
+    const deletes = new Set(queue.pendingDeletes);
+    const synced = new Set(queue.syncedIds);
+
+    upserts.delete(id);
+    synced.delete(id);
+    deletes.add(id);
+
+    saveSyncQueue({
+      ...queue,
+      pendingUpserts: Array.from(upserts),
+      pendingDeletes: Array.from(deletes),
+      syncedIds: Array.from(synced),
+    });
+
+    if (getSupabaseClient()) {
+      setSupabaseStatus('syncing');
+      deleteRemoteExpense(id)
+        .then((ok) => {
+          const latestQueue = loadSyncQueue();
+          const nextDeletes = new Set(latestQueue.pendingDeletes);
+          if (ok) {
+            nextDeletes.delete(id);
+            saveSyncQueue({
+              ...latestQueue,
+              pendingDeletes: Array.from(nextDeletes),
+            });
+            broadcastSyncSignal({ type: 'expense_deleted', id });
+            setSupabaseStatus('connected');
+          } else {
+            setSupabaseStatus('error');
+          }
+        })
+        .catch(() => setSupabaseStatus('error'));
+    }
   }, []);
 
   const handleSaveConfig = useCallback((newConfig: FinancialConfig) => {
+    configRef.current = newConfig;
+    saveConfig(newConfig);
     setConfig(newConfig);
-    saveRemoteConfig(newConfig).catch(() => {});
+
+    const queue = loadSyncQueue();
+    saveSyncQueue({ ...queue, pendingConfigSync: true });
+
+    if (getSupabaseClient()) {
+      setSupabaseStatus('syncing');
+      saveRemoteConfig(newConfig)
+        .then((ok) => {
+          if (ok) {
+            const latestQueue = loadSyncQueue();
+            saveSyncQueue({ ...latestQueue, pendingConfigSync: false });
+            broadcastSyncSignal({ type: 'config_updated', config: newConfig });
+            setSupabaseStatus('connected');
+          } else {
+            setSupabaseStatus('error');
+          }
+        })
+        .catch(() => setSupabaseStatus('error'));
+    }
+    setRealtimeEpoch((prev) => prev + 1);
   }, []);
+
+  const handleImportExpenses = useCallback(
+    (imported: Expense[]) => {
+      const queue = loadSyncQueue();
+      const upserts = new Set(queue.pendingUpserts);
+      imported.forEach((e) => upserts.add(e.id));
+      saveSyncQueue({ ...queue, pendingUpserts: Array.from(upserts) });
+      expensesRef.current = imported;
+      saveExpenses(imported);
+      setExpenses(imported);
+      syncWithSupabase();
+    },
+    [syncWithSupabase]
+  );
 
   return (
     <div className="min-h-screen bg-[#090A0F] text-slate-100 flex flex-col font-sans pb-12 select-none">
@@ -2159,6 +2500,8 @@ export default function App() {
                   ? 'Supabase Conectado (Clique para sincronizar)'
                   : supabaseStatus === 'syncing'
                   ? 'Sincronizando com Supabase...'
+                  : supabaseStatus === 'error'
+                  ? 'Erro ao sincronizar (Clique para tentar novamente)'
                   : 'Configurar banco de dados Supabase'
               }
             >
@@ -2171,6 +2514,11 @@ export default function App() {
                 <>
                   <RefreshCw className="w-3.5 h-3.5 text-amber-400 animate-spin" />
                   <span className="text-[11px] text-amber-300">Sync...</span>
+                </>
+              ) : supabaseStatus === 'error' ? (
+                <>
+                  <AlertTriangle className="w-3.5 h-3.5 text-rose-400" />
+                  <span className="text-[11px] text-rose-300">Erro Sync</span>
                 </>
               ) : (
                 <>
@@ -2274,7 +2622,7 @@ export default function App() {
         config={config}
         onSaveConfig={handleSaveConfig}
         expenses={expenses}
-        onImportExpenses={setExpenses}
+        onImportExpenses={handleImportExpenses}
         supabaseStatus={supabaseStatus}
         onSyncSupabase={syncWithSupabase}
       />

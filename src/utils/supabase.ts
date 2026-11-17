@@ -1,11 +1,53 @@
-import { createClient, SupabaseClient } from '@supabase/supabase-js';
+import { createClient, SupabaseClient, RealtimeChannel } from '@supabase/supabase-js';
 import { Expense, FinancialConfig, CategoryId } from '../types';
 
 const SUPABASE_STORAGE_KEY = 'cotadiaria_supabase_credentials_v1';
+const SYNC_QUEUE_STORAGE_KEY = 'cotadiaria_sync_queue_v1';
 
 export interface SupabaseCredentials {
   url: string;
   anonKey: string;
+}
+
+export interface SyncQueueState {
+  pendingUpserts: string[];
+  pendingDeletes: string[];
+  syncedIds: string[];
+  pendingConfigSync: boolean;
+}
+
+export const DEVICE_TAB_ID = `tab_${Math.random().toString(36).substring(2, 10)}_${Date.now()}`;
+
+export function loadSyncQueue(): SyncQueueState {
+  const empty: SyncQueueState = {
+    pendingUpserts: [],
+    pendingDeletes: [],
+    syncedIds: [],
+    pendingConfigSync: false,
+  };
+  if (typeof window === 'undefined') return empty;
+  try {
+    const raw = localStorage.getItem(SYNC_QUEUE_STORAGE_KEY);
+    if (!raw) return empty;
+    const parsed = JSON.parse(raw);
+    return {
+      pendingUpserts: Array.isArray(parsed.pendingUpserts) ? parsed.pendingUpserts : [],
+      pendingDeletes: Array.isArray(parsed.pendingDeletes) ? parsed.pendingDeletes : [],
+      syncedIds: Array.isArray(parsed.syncedIds) ? parsed.syncedIds : [],
+      pendingConfigSync: Boolean(parsed.pendingConfigSync),
+    };
+  } catch {
+    return empty;
+  }
+}
+
+export function saveSyncQueue(queue: SyncQueueState): void {
+  if (typeof window === 'undefined') return;
+  try {
+    localStorage.setItem(SYNC_QUEUE_STORAGE_KEY, JSON.stringify(queue));
+  } catch {
+    // Ignore storage quota errors
+  }
 }
 
 /**
@@ -85,7 +127,8 @@ export function saveSupabaseCredentials(creds: SupabaseCredentials): void {
       anonKey: creds.anonKey.trim(),
     };
     localStorage.setItem(SUPABASE_STORAGE_KEY, JSON.stringify(normalized));
-    cachedClient = null; // Invalidate cached instance
+    cachedClient = null;
+    activeRealtimeChannel = null;
   } catch {
     // Ignore
   }
@@ -96,6 +139,7 @@ export function clearSupabaseCredentials(): void {
   try {
     localStorage.removeItem(SUPABASE_STORAGE_KEY);
     cachedClient = null;
+    activeRealtimeChannel = null;
   } catch {
     // Ignore
   }
@@ -121,6 +165,11 @@ export function getSupabaseClient(): SupabaseClient | null {
       auth: {
         persistSession: false,
         autoRefreshToken: false,
+      },
+      realtime: {
+        params: {
+          eventsPerSecond: 10,
+        },
       },
     });
     lastUrl = url;
@@ -152,10 +201,14 @@ export async function checkSupabaseHealth(): Promise<{ ok: boolean; message: str
   try {
     const { error } = await client.from('expenses').select('id').limit(1);
     if (error) {
-      if (error.code === '42P01') {
+      if (
+        error.code === '42P01' ||
+        error.code === 'PGRST205' ||
+        error.message.includes('schema cache')
+      ) {
         return {
           ok: false,
-          message: 'Tabelas não encontradas no Supabase. Execute o script schema.sql no SQL Editor.',
+          message: 'Tabelas não encontradas no Supabase. Execute o script SQL no SQL Editor.',
         };
       }
       return { ok: false, message: `Erro ao conectar: ${error.message}` };
@@ -212,8 +265,13 @@ export async function upsertRemoteExpense(expense: Expense): Promise<boolean> {
       },
       { onConflict: 'id' }
     );
-    return !error;
-  } catch {
+    if (error) {
+      console.warn('Supabase upsert expense error:', error);
+      return false;
+    }
+    return true;
+  } catch (e) {
+    console.warn('Supabase upsert expense failed:', e);
     return false;
   }
 }
@@ -224,8 +282,13 @@ export async function deleteRemoteExpense(id: string): Promise<boolean> {
 
   try {
     const { error } = await client.from('expenses').delete().eq('id', id);
-    return !error;
-  } catch {
+    if (error) {
+      console.warn('Supabase delete expense error:', error);
+      return false;
+    }
+    return true;
+  } catch (e) {
+    console.warn('Supabase delete expense failed:', e);
     return false;
   }
 }
@@ -276,8 +339,144 @@ export async function saveRemoteConfig(config: FinancialConfig): Promise<boolean
       },
       { onConflict: 'id' }
     );
-    return !error;
+    if (error) {
+      console.warn('Supabase save config error:', error);
+      return false;
+    }
+    return true;
   } catch {
     return false;
   }
+}
+
+/* ==========================================================================
+   REALTIME SYNC & BROADCAST ENGINE (Multi-Device Instant Sync)
+   ========================================================================== */
+
+export type SyncBroadcastPayload =
+  | { senderId: string; type: 'expense_upserted'; expense: Expense }
+  | { senderId: string; type: 'expense_deleted'; id: string }
+  | { senderId: string; type: 'config_updated'; config: FinancialConfig }
+  | { senderId: string; type: 'force_sync' };
+
+let activeRealtimeChannel: RealtimeChannel | null = null;
+
+export function broadcastSyncSignal(
+  payload:
+    | { type: 'expense_upserted'; expense: Expense }
+    | { type: 'expense_deleted'; id: string }
+    | { type: 'config_updated'; config: FinancialConfig }
+    | { type: 'force_sync' }
+): void {
+  if (!activeRealtimeChannel) return;
+  try {
+    activeRealtimeChannel
+      .send({
+        type: 'broadcast',
+        event: 'sync_signal',
+        payload: { ...payload, senderId: DEVICE_TAB_ID },
+      })
+      .catch(() => {});
+  } catch {
+    // Ignore if channel is closing
+  }
+}
+
+export interface RealtimeCallbacks {
+  onExpenseUpserted: (expense: Expense) => void;
+  onExpenseDeleted: (id: string) => void;
+  onConfigUpdated: (config: FinancialConfig) => void;
+  onRemoteSyncRequested: () => void;
+}
+
+export function subscribeToRealtimeSync(callbacks: RealtimeCallbacks): () => void {
+  const client = getSupabaseClient();
+  if (!client) return () => {};
+
+  // Clean up any previous channel on this client
+  if (activeRealtimeChannel) {
+    client.removeChannel(activeRealtimeChannel).catch(() => {});
+    activeRealtimeChannel = null;
+  }
+
+  const channel = client
+    .channel('cotadiaria-sync-v1', {
+      config: {
+        broadcast: { self: false },
+      },
+    })
+    // 1. Instant Broadcast Events (Works immediately without SQL Publication setup)
+    .on('broadcast', { event: 'sync_signal' }, ({ payload }) => {
+      const msg = payload as SyncBroadcastPayload | undefined;
+      if (!msg || msg.senderId === DEVICE_TAB_ID) return;
+
+      if (msg.type === 'expense_upserted') {
+        callbacks.onExpenseUpserted(msg.expense);
+      } else if (msg.type === 'expense_deleted') {
+        callbacks.onExpenseDeleted(msg.id);
+      } else if (msg.type === 'config_updated') {
+        callbacks.onConfigUpdated(msg.config);
+      } else if (msg.type === 'force_sync') {
+        callbacks.onRemoteSyncRequested();
+      }
+    })
+    // 2. Postgres Changes for Expenses (Works when SQL Publication is enabled)
+    .on(
+      'postgres_changes',
+      { event: '*', schema: 'public', table: 'expenses' },
+      (payload) => {
+        if (payload.eventType === 'INSERT' || payload.eventType === 'UPDATE') {
+          const row = payload.new as Record<string, unknown>;
+          if (row && row.id) {
+            callbacks.onExpenseUpserted({
+              id: String(row.id),
+              amount: Number(row.amount),
+              category: row.category as CategoryId,
+              note: String(row.note || ''),
+              date: String(row.date),
+              timestamp: Number(row.timestamp),
+            });
+          }
+        } else if (payload.eventType === 'DELETE') {
+          const oldRow = payload.old as Record<string, unknown> | undefined;
+          if (oldRow && oldRow.id) {
+            callbacks.onExpenseDeleted(String(oldRow.id));
+          } else {
+            // Fallback if REPLICA IDENTITY wasn't FULL: fetch fresh state from DB
+            callbacks.onRemoteSyncRequested();
+          }
+        }
+      }
+    )
+    // 3. Postgres Changes for Financial Config
+    .on(
+      'postgres_changes',
+      { event: '*', schema: 'public', table: 'financial_config' },
+      (payload) => {
+        if (payload.eventType === 'INSERT' || payload.eventType === 'UPDATE') {
+          const row = payload.new as Record<string, unknown>;
+          if (row && row.id === 'default') {
+            callbacks.onConfigUpdated({
+              monthlyIncome: Number(row.monthly_income),
+              fixedExpenses: Number(row.fixed_expenses),
+              monthlyGoal: Number(row.monthly_goal),
+              daysInMonth: Number(row.days_in_month),
+              compensationMode: row.compensation_mode as 'next_day' | 'distribute_month',
+              soundEnabled: Boolean(row.sound_enabled),
+              hapticEnabled: Boolean(row.haptic_enabled),
+            });
+          }
+        }
+      }
+    )
+    .subscribe();
+
+  activeRealtimeChannel = channel;
+
+  return () => {
+    if (activeRealtimeChannel === channel) {
+      activeRealtimeChannel = null;
+    }
+    client.removeChannel(channel).catch(() => {});
+  };
 }
