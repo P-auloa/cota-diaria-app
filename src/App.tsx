@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useState, useEffect, useMemo, useCallback } from 'react';
+import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react';
 import {
   Settings,
   ChevronLeft,
@@ -46,8 +46,28 @@ import {
   Download,
   Share,
   WifiOff,
+  Cloud,
+  CloudOff,
+  Database,
+  RefreshCw,
+  Copy,
+  CheckCheck,
+  ExternalLink,
 } from 'lucide-react';
 import confetti from 'canvas-confetti';
+import {
+  getSupabaseCredentials,
+  saveSupabaseCredentials,
+  clearSupabaseCredentials,
+  isValidSupabaseUrl,
+  getSupabaseClient,
+  checkSupabaseHealth,
+  fetchRemoteExpenses,
+  upsertRemoteExpense,
+  deleteRemoteExpense,
+  fetchRemoteConfig,
+  saveRemoteConfig,
+} from './utils/supabase';
 
 /* ==========================================================================
    1. TYPES & DATA INTERFACES
@@ -88,6 +108,7 @@ export interface FinancialConfig {
   compensationMode: 'next_day' | 'distribute_month'; // 'next_day' (SDD padrão)
   soundEnabled: boolean;
   hapticEnabled: boolean;
+  rolloverSavings?: boolean;
 }
 
 export interface DayCalculation {
@@ -1323,6 +1344,40 @@ export const MonthSummaryCard: React.FC<MonthSummaryCardProps> = ({
    14. COMPONENT: SETTINGS MODAL
    ========================================================================== */
 
+const SUPABASE_SQL_SCRIPT = `-- 1. Tabela de Despesas Diárias (expenses)
+CREATE TABLE IF NOT EXISTS public.expenses (
+  id TEXT PRIMARY KEY,
+  amount NUMERIC(10, 2) NOT NULL,
+  category TEXT NOT NULL,
+  note TEXT DEFAULT '',
+  date DATE NOT NULL,
+  timestamp BIGINT NOT NULL,
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_expenses_date ON public.expenses (date);
+CREATE INDEX IF NOT EXISTS idx_expenses_timestamp ON public.expenses (timestamp DESC);
+
+-- 2. Tabela de Configuração Financeira (financial_config)
+CREATE TABLE IF NOT EXISTS public.financial_config (
+  id TEXT PRIMARY KEY DEFAULT 'default',
+  monthly_income NUMERIC(10, 2) NOT NULL DEFAULT 6000.00,
+  fixed_expenses NUMERIC(10, 2) NOT NULL DEFAULT 3000.00,
+  monthly_goal NUMERIC(10, 2) NOT NULL DEFAULT 1200.00,
+  days_in_month INT NOT NULL DEFAULT 30,
+  compensation_mode TEXT NOT NULL DEFAULT 'next_day',
+  sound_enabled BOOLEAN NOT NULL DEFAULT true,
+  haptic_enabled BOOLEAN NOT NULL DEFAULT true,
+  updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- 3. Habilitar Row Level Security (RLS) e Políticas Anônimas
+ALTER TABLE public.expenses ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.financial_config ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY "Permissao anon para expenses" ON public.expenses FOR ALL TO anon, authenticated USING (true) WITH CHECK (true);
+CREATE POLICY "Permissao anon para financial_config" ON public.financial_config FOR ALL TO anon, authenticated USING (true) WITH CHECK (true);`;
+
 interface SettingsModalProps {
   isOpen: boolean;
   onClose: () => void;
@@ -1330,6 +1385,8 @@ interface SettingsModalProps {
   onSaveConfig: (newConfig: FinancialConfig) => void;
   expenses: Expense[];
   onImportExpenses: (expenses: Expense[]) => void;
+  supabaseStatus: 'connected' | 'syncing' | 'error' | 'unconfigured';
+  onSyncSupabase: () => Promise<void>;
 }
 
 export const SettingsModal: React.FC<SettingsModalProps> = ({
@@ -1339,12 +1396,27 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   onSaveConfig,
   expenses,
   onImportExpenses,
+  supabaseStatus,
+  onSyncSupabase,
 }) => {
   const [formData, setFormData] = useState<FinancialConfig>({ ...config });
   const [importSuccess, setImportSuccess] = useState<string | null>(null);
 
+  // Supabase connection state
+  const initialCreds = getSupabaseCredentials();
+  const [supabaseUrl, setSupabaseUrl] = useState<string>(initialCreds.url);
+  const [supabaseAnonKey, setSupabaseAnonKey] = useState<string>(initialCreds.anonKey);
+  const [isTestingSupabase, setIsTestingSupabase] = useState(false);
+  const [testResult, setTestResult] = useState<{ ok: boolean; message: string } | null>(null);
+  const [copiedSql, setCopiedSql] = useState(false);
+  const [showSqlCode, setShowSqlCode] = useState(false);
+
   useEffect(() => {
     setFormData({ ...config });
+    const c = getSupabaseCredentials();
+    setSupabaseUrl(c.url);
+    setSupabaseAnonKey(c.anonKey);
+    setTestResult(null);
   }, [config, isOpen]);
 
   if (!isOpen) return null;
@@ -1353,11 +1425,45 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   const previewDiscretionary =
     formData.monthlyIncome - formData.fixedExpenses - formData.monthlyGoal;
 
+  const handleTestConnection = async () => {
+    setIsTestingSupabase(true);
+    setTestResult(null);
+    playKeyClick(formData.soundEnabled);
+
+    if (supabaseUrl.trim() && supabaseAnonKey.trim()) {
+      saveSupabaseCredentials({ url: supabaseUrl, anonKey: supabaseAnonKey });
+    } else {
+      clearSupabaseCredentials();
+    }
+    const result = await checkSupabaseHealth();
+    setIsTestingSupabase(false);
+    setTestResult(result);
+    if (result.ok) {
+      await onSyncSupabase();
+    }
+  };
+
+  const handleCopySql = () => {
+    playKeyClick(formData.soundEnabled);
+    if (typeof navigator !== 'undefined' && navigator.clipboard) {
+      navigator.clipboard.writeText(SUPABASE_SQL_SCRIPT);
+      setCopiedSql(true);
+      setTimeout(() => setCopiedSql(false), 2500);
+    }
+  };
+
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     playKeyClick(formData.soundEnabled);
     triggerHaptic(15, formData.hapticEnabled);
+
+    if (supabaseUrl.trim() && supabaseAnonKey.trim() && isValidSupabaseUrl(supabaseUrl)) {
+      saveSupabaseCredentials({ url: supabaseUrl, anonKey: supabaseAnonKey });
+    } else if (!supabaseUrl.trim() && !supabaseAnonKey.trim()) {
+      clearSupabaseCredentials();
+    }
     onSaveConfig(formData);
+    onSyncSupabase().catch(() => {});
     onClose();
   };
 
@@ -1420,8 +1526,8 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
               <Sliders className="w-4 h-4 text-emerald-400" />
             </div>
             <div>
-              <h3 className="text-base font-bold text-white">Configurações da Cota</h3>
-              <p className="text-xs text-slate-400">Parâmetros financeiros & SDD</p>
+              <h3 className="text-base font-bold text-white">Configurações & Nuvem</h3>
+              <p className="text-xs text-slate-400">Parâmetros financeiros, Supabase e Vercel</p>
             </div>
           </div>
           <button
@@ -1434,6 +1540,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
         </div>
 
         <form onSubmit={handleSubmit} className="mt-4 space-y-4">
+          {/* Cota Base Preview */}
           <div className="bg-gradient-to-br from-emerald-950/30 to-slate-900/90 border border-emerald-500/30 rounded-xl p-3">
             <div className="flex justify-between items-center text-xs">
               <span className="text-slate-300 font-medium">Cota Base Resultante:</span>
@@ -1446,6 +1553,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
             </div>
           </div>
 
+          {/* Renda Mensal */}
           <div>
             <label className="block text-xs font-semibold text-slate-300 mb-1">
               Renda Mensal (R$)
@@ -1462,6 +1570,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
             />
           </div>
 
+          {/* Despesas Fixas */}
           <div>
             <label className="block text-xs font-semibold text-slate-300 mb-1">
               Despesas Fixas (R$) (Aluguel, Contas, etc.)
@@ -1478,6 +1587,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
             />
           </div>
 
+          {/* Meta Poupança / Reserva */}
           <div>
             <label className="block text-xs font-semibold text-slate-300 mb-1">
               Meta de Economia / Poupança (R$)
@@ -1494,6 +1604,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
             />
           </div>
 
+          {/* Dias no Mês */}
           <div>
             <label className="block text-xs font-semibold text-slate-300 mb-1">
               Dias no Ciclo / Mês
@@ -1510,6 +1621,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
             />
           </div>
 
+          {/* Modo de Compensação do Estouro */}
           <div>
             <label className="block text-xs font-semibold text-slate-300 mb-1.5">
               Modo de Compensação do Estouro
@@ -1547,6 +1659,113 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
             </div>
           </div>
 
+          {/* Supabase & Vercel Integration Section */}
+          <div className="pt-3 border-t border-slate-800 space-y-3">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-1.5">
+                <Database className="w-4 h-4 text-emerald-400" />
+                <span className="text-xs font-bold text-white uppercase tracking-wider">
+                  Supabase & Nuvem (Vercel)
+                </span>
+              </div>
+              <span
+                className={`text-[10px] font-semibold px-2 py-0.5 rounded-full border ${
+                  supabaseStatus === 'connected'
+                    ? 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30'
+                    : supabaseStatus === 'syncing'
+                    ? 'bg-amber-500/15 text-amber-300 border-amber-500/30'
+                    : 'bg-slate-800 text-slate-400 border-slate-700'
+                }`}
+              >
+                {supabaseStatus === 'connected'
+                  ? 'Conectado'
+                  : supabaseStatus === 'syncing'
+                  ? 'Sincronizando...'
+                  : 'Modo Local'}
+              </span>
+            </div>
+
+            <div>
+              <label className="block text-[11px] font-medium text-slate-400 mb-1">
+                URL do Projeto Supabase
+              </label>
+              <input
+                type="text"
+                placeholder="https://seu-projeto.supabase.co"
+                value={supabaseUrl}
+                onChange={(e) => setSupabaseUrl(e.target.value)}
+                className="w-full rounded-xl bg-slate-900 border border-slate-800 px-3 py-2 text-xs text-white font-mono focus:border-emerald-500 focus:outline-none"
+              />
+            </div>
+
+            <div>
+              <label className="block text-[11px] font-medium text-slate-400 mb-1">
+                Chave Anon Pública (anon key)
+              </label>
+              <input
+                type="password"
+                placeholder="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
+                value={supabaseAnonKey}
+                onChange={(e) => setSupabaseAnonKey(e.target.value)}
+                className="w-full rounded-xl bg-slate-900 border border-slate-800 px-3 py-2 text-xs text-white font-mono focus:border-emerald-500 focus:outline-none"
+              />
+            </div>
+
+            {/* Test Connection and Copy SQL Actions */}
+            <div className="grid grid-cols-2 gap-2 pt-1">
+              <button
+                type="button"
+                disabled={isTestingSupabase || !supabaseUrl || !supabaseAnonKey}
+                onClick={handleTestConnection}
+                className="flex items-center justify-center gap-1.5 py-2 px-3 rounded-xl bg-slate-900 border border-slate-800 hover:bg-slate-800 text-xs font-medium text-slate-200 transition disabled:opacity-50"
+              >
+                <RefreshCw className={`w-3.5 h-3.5 text-emerald-400 ${isTestingSupabase ? 'animate-spin' : ''}`} />
+                <span>{isTestingSupabase ? 'Testando...' : 'Testar Conexão'}</span>
+              </button>
+
+              <button
+                type="button"
+                onClick={handleCopySql}
+                className="flex items-center justify-center gap-1.5 py-2 px-3 rounded-xl bg-slate-900 border border-slate-800 hover:bg-slate-800 text-xs font-medium text-slate-200 transition"
+                title="Copiar script SQL para o SQL Editor do Supabase"
+              >
+                {copiedSql ? (
+                  <>
+                    <CheckCheck className="w-3.5 h-3.5 text-emerald-400" />
+                    <span className="text-emerald-300">Copiado!</span>
+                  </>
+                ) : (
+                  <>
+                    <Copy className="w-3.5 h-3.5 text-cyan-400" />
+                    <span>Copiar SQL</span>
+                  </>
+                )}
+              </button>
+            </div>
+
+            {testResult && (
+              <div
+                className={`text-[11px] p-2 rounded-xl border leading-relaxed ${
+                  testResult.ok
+                    ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-300'
+                    : 'bg-rose-500/10 border-rose-500/30 text-rose-300'
+                }`}
+              >
+                {testResult.message}
+              </div>
+            )}
+
+            <div className="text-[10px] text-slate-400 bg-slate-950/70 p-2.5 rounded-xl border border-slate-800/80 leading-relaxed space-y-1">
+              <div>
+                🚀 <strong className="text-slate-300">Deploy na Vercel:</strong> Adicione <code className="text-emerald-300">VITE_SUPABASE_URL</code> e <code className="text-emerald-300">VITE_SUPABASE_ANON_KEY</code> nas Environment Variables do projeto na Vercel.
+              </div>
+              <div>
+                ⚡ O app funciona 100% offline se não houver internet, sincronizando assim que reconectar.
+              </div>
+            </div>
+          </div>
+
+          {/* Sons & Haptic Feedback */}
           <div className="pt-2 border-t border-slate-800 space-y-2">
             <div className="flex items-center justify-between text-xs">
               <span className="flex items-center gap-2 text-slate-300">
@@ -1589,9 +1808,10 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
             </div>
           </div>
 
+          {/* Backup Offline em JSON */}
           <div className="pt-2 border-t border-slate-800">
             <div className="text-xs font-semibold text-slate-400 mb-2">
-              Backup Offline & Dados
+              Backup Offline em Arquivo
             </div>
             <div className="grid grid-cols-2 gap-2">
               <button
@@ -1621,6 +1841,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
             )}
           </div>
 
+          {/* Bottom Actions */}
           <div className="pt-3 border-t border-slate-800 flex items-center justify-between gap-2">
             <button
               type="button"
@@ -1771,14 +1992,80 @@ export default function App() {
   const [expenses, setExpenses] = useState<Expense[]>(() => loadExpenses());
   const [selectedDate, setSelectedDate] = useState<string>(() => getTodayDateString());
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [supabaseStatus, setSupabaseStatus] = useState<
+    'connected' | 'syncing' | 'error' | 'unconfigured'
+  >(() => {
+    const creds = getSupabaseCredentials();
+    return isValidSupabaseUrl(creds.url) && creds.anonKey ? 'syncing' : 'unconfigured';
+  });
 
+  const configRef = useRef(config);
   useEffect(() => {
+    configRef.current = config;
     saveConfig(config);
   }, [config]);
 
   useEffect(() => {
     saveExpenses(expenses);
   }, [expenses]);
+
+  // Synchronize with Supabase
+  const syncWithSupabase = useCallback(async () => {
+    const client = getSupabaseClient();
+    if (!client) {
+      setSupabaseStatus('unconfigured');
+      return;
+    }
+
+    setSupabaseStatus('syncing');
+    try {
+      const remoteExpenses = await fetchRemoteExpenses();
+      if (remoteExpenses !== null) {
+        setExpenses((local) => {
+          const map = new Map<string, Expense>();
+          local.forEach((e) => map.set(e.id, e));
+
+          const remoteIds = new Set(remoteExpenses.map((r) => r.id));
+          local.forEach((l) => {
+            if (!remoteIds.has(l.id)) {
+              upsertRemoteExpense(l).catch(() => {});
+            }
+          });
+
+          remoteExpenses.forEach((r) => {
+            map.set(r.id, r);
+          });
+
+          const merged = Array.from(map.values()).sort((a, b) => b.timestamp - a.timestamp);
+          saveExpenses(merged);
+          return merged;
+        });
+      }
+
+      const remoteConfig = await fetchRemoteConfig();
+      if (remoteConfig !== null) {
+        setConfig((local) => {
+          const mergedConfig = { ...local, ...remoteConfig };
+          saveConfig(mergedConfig);
+          return mergedConfig;
+        });
+      } else {
+        saveRemoteConfig(configRef.current).catch(() => {});
+      }
+
+      setSupabaseStatus('connected');
+    } catch {
+      setSupabaseStatus('error');
+    }
+  }, []);
+
+  // Initial sync on app mount
+  useEffect(() => {
+    const creds = getSupabaseCredentials();
+    if (isValidSupabaseUrl(creds.url) && creds.anonKey) {
+      syncWithSupabase();
+    }
+  }, [syncWithSupabase]);
 
   const todayStr = getTodayDateString();
   const isViewingToday = selectedDate === todayStr;
@@ -1806,6 +2093,9 @@ export default function App() {
 
       setExpenses((prev) => [newExpense, ...prev]);
 
+      // Push to Supabase in background
+      upsertRemoteExpense(newExpense).catch(() => {});
+
       if (currentCalculation.remainingBalance >= amount) {
         confetti({
           particleCount: 25,
@@ -1821,6 +2111,12 @@ export default function App() {
 
   const handleDeleteExpense = useCallback((id: string) => {
     setExpenses((prev) => prev.filter((e) => e.id !== id));
+    deleteRemoteExpense(id).catch(() => {});
+  }, []);
+
+  const handleSaveConfig = useCallback((newConfig: FinancialConfig) => {
+    setConfig(newConfig);
+    saveRemoteConfig(newConfig).catch(() => {});
   }, []);
 
   return (
@@ -1847,6 +2143,43 @@ export default function App() {
           </div>
 
           <div className="flex items-center gap-2">
+            {/* Supabase Cloud Status Indicator */}
+            <button
+              type="button"
+              onClick={() => {
+                if (supabaseStatus === 'unconfigured') {
+                  setSettingsOpen(true);
+                } else {
+                  syncWithSupabase();
+                }
+              }}
+              className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-full text-xs font-semibold border transition active:scale-95 bg-slate-900 border-slate-800 text-slate-300 hover:text-white hover:border-slate-700"
+              title={
+                supabaseStatus === 'connected'
+                  ? 'Supabase Conectado (Clique para sincronizar)'
+                  : supabaseStatus === 'syncing'
+                  ? 'Sincronizando com Supabase...'
+                  : 'Configurar banco de dados Supabase'
+              }
+            >
+              {supabaseStatus === 'connected' ? (
+                <>
+                  <Cloud className="w-3.5 h-3.5 text-emerald-400" />
+                  <span className="text-[11px] text-emerald-300">Nuvem</span>
+                </>
+              ) : supabaseStatus === 'syncing' ? (
+                <>
+                  <RefreshCw className="w-3.5 h-3.5 text-amber-400 animate-spin" />
+                  <span className="text-[11px] text-amber-300">Sync...</span>
+                </>
+              ) : (
+                <>
+                  <Database className="w-3.5 h-3.5 text-slate-400" />
+                  <span className="text-[11px] text-slate-400">Local</span>
+                </>
+              )}
+            </button>
+
             <PWAInstallButton />
 
             <button
@@ -1923,10 +2256,10 @@ export default function App() {
           calculation={currentCalculation}
         />
 
-        {/* 5. Visão e Projeção Mensal */}
+        {/* 4. Visão e Projeção Mensal */}
         <MonthSummaryCard config={config} allExpenses={expenses} />
 
-        {/* 6. Lista de Gastos do Dia */}
+        {/* 5. Lista de Gastos do Dia */}
         <ExpenseList
           expenses={activeDateExpenses}
           onDeleteExpense={handleDeleteExpense}
@@ -1939,9 +2272,11 @@ export default function App() {
         isOpen={settingsOpen}
         onClose={() => setSettingsOpen(false)}
         config={config}
-        onSaveConfig={setConfig}
+        onSaveConfig={handleSaveConfig}
         expenses={expenses}
         onImportExpenses={setExpenses}
+        supabaseStatus={supabaseStatus}
+        onSyncSupabase={syncWithSupabase}
       />
     </div>
   );

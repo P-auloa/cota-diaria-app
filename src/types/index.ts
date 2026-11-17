@@ -33,7 +33,7 @@ export interface FinancialConfig {
   compensationMode: 'next_day' | 'distribute_month'; // 'next_day' is SDD default
   soundEnabled: boolean;
   hapticEnabled: boolean;
-  rolloverSavings: boolean;   // Se sobrar cota, acumula no cofre
+  rolloverSavings?: boolean;   // Se sobrar cota, acumula no cofre
 }
 
 export interface DayCalculation {
